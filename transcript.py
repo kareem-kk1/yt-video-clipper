@@ -1,16 +1,16 @@
-
 from __future__ import annotations
-
 import gc
 import time
-
 from pathlib import Path
 from typing import Any
-
 import torch
 import whisper
-
+from config import configure_ffmpeg, WHISPER_MODEL
 from logger_config import logger, log_step
+
+# ============================================================
+# DEVICE SELECTION
+# ============================================================
 
 def get_processing_device(device: str) -> str:
     """Resolve and validate the requested processing device."""
@@ -21,6 +21,7 @@ def get_processing_device(device: str) -> str:
         )
 
     if device == "cpu":
+        logger.info("CPU processing selected.")
         return "cpu"
 
     if torch.cuda.is_available():
@@ -42,16 +43,25 @@ def get_processing_device(device: str) -> str:
 
     return "cpu"
 
+
+# ============================================================
+# WHISPER TRANSCRIPTION
+# ============================================================
+
 def transcribe_audio_with_whisper(
     file_path: str,
-    model_size: str = "base",
     device: str = "cuda",
 ) -> tuple[list[dict[str, Any]], str]:
     """
-    Transcribe audio using OpenAI Whisper.
+    Transcribe video audio using OpenAI Whisper.
 
-    CUDA is the default processing device.
-    CPU fallback is not performed automatically when CUDA fails.
+    Model:
+        base (fixed)
+
+    Device:
+        cuda by default
+        auto for automatic CPU fallback
+        cpu for CPU-only processing
     """
 
     log_step(
@@ -62,6 +72,16 @@ def transcribe_audio_with_whisper(
     model = None
 
     try:
+        # ----------------------------------------------------
+        # FFMPEG VALIDATION
+        # ----------------------------------------------------
+
+        configure_ffmpeg()
+
+        # ----------------------------------------------------
+        # INPUT VALIDATION
+        # ----------------------------------------------------
+
         video_path = Path(file_path)
 
         if not video_path.is_file():
@@ -69,25 +89,13 @@ def transcribe_audio_with_whisper(
                 f"Input video not found: {video_path}"
             )
 
-        if model_size not in {
-            "tiny",
-            "base",
-            "small",
-            "medium",
-            "large",
-            "turbo",
-        }:
-            raise ValueError(
-                f"Unsupported Whisper model: {model_size}"
-            )
-
         logger.info("Input file: %s", video_path)
-        logger.info("Whisper model: %s", model_size)
+        logger.info("Whisper model: %s", WHISPER_MODEL)
         logger.info("Requested device: %s", device)
 
-        # --------------------------------------------------
+        # ----------------------------------------------------
         # DEVICE SELECTION
-        # --------------------------------------------------
+        # ----------------------------------------------------
 
         selected_device = get_processing_device(device)
 
@@ -107,19 +115,19 @@ def transcribe_audio_with_whisper(
 
             torch.cuda.empty_cache()
 
-        # --------------------------------------------------
+        # ----------------------------------------------------
         # LOAD WHISPER MODEL
-        # --------------------------------------------------
+        # ----------------------------------------------------
 
         logger.info(
-            "Loading Whisper model on %s...",
+            "Loading Whisper base model on %s...",
             selected_device,
         )
 
         load_start = time.perf_counter()
 
         model = whisper.load_model(
-            model_size,
+            WHISPER_MODEL,
             device=selected_device,
         )
 
@@ -130,9 +138,9 @@ def transcribe_audio_with_whisper(
             load_time,
         )
 
-        # --------------------------------------------------
+        # ----------------------------------------------------
         # TRANSCRIBE VIDEO
-        # --------------------------------------------------
+        # ----------------------------------------------------
 
         logger.info(
             "Starting transcription on %s...",
@@ -157,9 +165,9 @@ def transcribe_audio_with_whisper(
             transcription_time,
         )
 
-        # --------------------------------------------------
+        # ----------------------------------------------------
         # EXTRACT TIMESTAMPED SEGMENTS
-        # --------------------------------------------------
+        # ----------------------------------------------------
 
         rows: list[dict[str, Any]] = []
 
@@ -170,15 +178,22 @@ def transcribe_audio_with_whisper(
             if not isinstance(segment, dict):
                 continue
 
-            text = str(
-                segment.get("text") or ""
-            ).strip()
+            try:
+                text = str(
+                    segment.get("text") or ""
+                ).strip()
+
+                start = float(segment["start"])
+                end = float(segment["end"])
+
+            except (KeyError, TypeError, ValueError):
+                logger.warning(
+                    "Skipping malformed transcript segment."
+                )
+                continue
 
             if not text:
                 continue
-
-            start = float(segment["start"])
-            end = float(segment["end"])
 
             if start < 0 or end <= start:
                 logger.warning(
@@ -196,9 +211,9 @@ def transcribe_audio_with_whisper(
                 }
             )
 
-        # --------------------------------------------------
+        # ----------------------------------------------------
         # EXTRACT METADATA
-        # --------------------------------------------------
+        # ----------------------------------------------------
 
         language = str(
             transcript.get("language") or "unknown"
@@ -233,9 +248,9 @@ def transcribe_audio_with_whisper(
                 "No speech detected in the video."
             )
 
-        # --------------------------------------------------
+        # ----------------------------------------------------
         # GPU MEMORY INFORMATION
-        # --------------------------------------------------
+        # ----------------------------------------------------
 
         if selected_device == "cuda":
 

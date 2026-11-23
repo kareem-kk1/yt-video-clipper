@@ -3,43 +3,48 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 import uuid
 import zipfile
+
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
 import streamlit as st
 
 from yt_downloader import download_video
 from transcript import transcribe_audio_with_whisper
 from llama_call import choose_moments
+
 from clip_window import (
     candidate_windows,
     make_ass,
     write_srt,
     run_ffmpeg,
 )
+
 from logger_config import logger
 
+from config import (
+    OUTPUT_DIR,
+    WORK_DIR,
+    WHISPER_MODEL,
+    PROCESSING_DEVICES,
+    DEFAULT_PROCESSING_DEVICE,
+    CLIP_COUNTS,
+    DEFAULT_CLIP_COUNT,
+    CLIP_LENGTHS,
+    DEFAULT_CLIP_LENGTH,
+    SUBTITLE_STYLES,
+    DEFAULT_SUBTITLE_STYLE,
+    check_ffmpeg,
+    create_project_directories,
+)
+
 
 # ============================================================
-# PATH CONFIGURATION
-# ============================================================
-
-APP_DIR = Path(__file__).resolve().parent
-
-OUTPUT_DIR = APP_DIR / "outputs"
-WORK_DIR = APP_DIR / "work"
-LOG_DIR = APP_DIR / "logs"
-
-for directory in (OUTPUT_DIR, WORK_DIR, LOG_DIR):
-    directory.mkdir(parents=True, exist_ok=True)
-
-
-# ============================================================
-# STREAMLIT CONFIGURATION
+# INITIALIZATION
 # ============================================================
 
 st.set_page_config(
@@ -47,6 +52,8 @@ st.set_page_config(
     page_icon="🎬",
     layout="wide",
 )
+
+create_project_directories()
 
 st.title("🎬 AI YouTube Shorts Generator")
 st.caption(
@@ -81,29 +88,6 @@ for key, default_value in SESSION_DEFAULTS.items():
 # HELPER FUNCTIONS
 # ============================================================
 
-def check_ffmpeg() -> bool:
-    """Check whether FFmpeg is installed and accessible."""
-
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-version"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        )
-
-        return result.returncode == 0
-
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        logger.exception("FFmpeg is unavailable or timed out.")
-        return False
-
-    except Exception:
-        logger.exception("Unexpected FFmpeg check error.")
-        return False
-
-
 def validate_processing_device(device: str) -> None:
     """Validate the selected processing device."""
 
@@ -120,6 +104,7 @@ def validate_processing_device(device: str) -> None:
         import torch
 
     except ImportError as exc:
+
         if device == "cuda":
             raise RuntimeError(
                 "PyTorch is not installed. Install CUDA-enabled "
@@ -133,6 +118,7 @@ def validate_processing_device(device: str) -> None:
         return
 
     if torch.cuda.is_available():
+
         gpu_name = torch.cuda.get_device_name(0)
 
         logger.info(
@@ -141,12 +127,14 @@ def validate_processing_device(device: str) -> None:
         )
 
     elif device == "cuda":
+
         raise RuntimeError(
             "CUDA is unavailable. Check your NVIDIA drivers "
             "and CUDA-enabled PyTorch installation."
         )
 
     else:
+
         logger.warning(
             "CUDA unavailable. Automatic device selection "
             "will use CPU."
@@ -158,7 +146,7 @@ def update_progress(
     percentage: float,
     message: str,
 ) -> None:
-    """Safely update the overall progress bar."""
+    """Update the single overall progress bar."""
 
     percentage = max(
         0.0,
@@ -171,6 +159,35 @@ def update_progress(
     )
 
 
+def validate_video_metadata(
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate and normalize downloaded video metadata."""
+
+    title = str(
+        metadata.get("title") or "YouTube video"
+    ).strip()
+
+    try:
+        duration = float(
+            metadata.get("duration") or 0
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Invalid video duration returned by YouTube."
+        ) from exc
+
+    if duration <= 0:
+        raise ValueError(
+            "YouTube returned an invalid video duration."
+        )
+
+    return {
+        "title": title,
+        "duration": duration,
+    }
+
+
 # ============================================================
 # VIDEO CACHE
 # ============================================================
@@ -180,10 +197,9 @@ def get_cached_video(
     download_progress_callback: Callable[[float], None] | None = None,
 ) -> tuple[Path, Path, dict[str, Any]]:
     """
-    Reuse a downloaded video when the URL is unchanged.
+    Reuse an existing downloaded video when the URL matches.
 
-    Download a new video when the URL changes or the cached
-    video is missing.
+    Otherwise, download a new video into a unique working directory.
     """
 
     cached_url = st.session_state.get("cached_url")
@@ -196,6 +212,7 @@ def get_cached_video(
     # --------------------------------------------------------
 
     if cached_url == video_url and cached_video and cached_job:
+
         video_path = Path(cached_video)
         job_path = Path(cached_job)
 
@@ -204,6 +221,7 @@ def get_cached_video(
             and job_path.is_dir()
             and isinstance(cached_info, dict)
         ):
+
             logger.info(
                 "Reusing cached video: %s",
                 video_path,
@@ -221,39 +239,37 @@ def get_cached_video(
     logger.info("Downloading a new YouTube video.")
 
     job_path = WORK_DIR / uuid.uuid4().hex
-    job_path.mkdir(parents=True, exist_ok=True)
+
+    job_path.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     try:
+
         video_path, download_info = download_video(
             video_url=video_url,
             folder=job_path,
-            APP_DIR=APP_DIR,
             progress_callback=download_progress_callback,
         )
 
+        video_path = Path(video_path)
+
         if not video_path.is_file():
+
             raise FileNotFoundError(
                 f"Downloaded video was not found: {video_path}"
             )
 
         if not isinstance(download_info, Mapping):
+
             raise TypeError(
                 "Video metadata must be a valid mapping."
             )
 
-        info: dict[str, Any] = {
-            "title": str(
-                download_info.get("title") or "YouTube video"
-            ),
-            "duration": float(
-                download_info.get("duration") or 0
-            ),
-        }
-
-        if info["duration"] <= 0:
-            raise ValueError(
-                "YouTube returned an invalid video duration."
-            )
+        info = validate_video_metadata(
+            download_info
+        )
 
         # ----------------------------------------------------
         # SAVE VIDEO CACHE
@@ -264,11 +280,11 @@ def get_cached_video(
         st.session_state["cached_video"] = str(video_path)
         st.session_state["cached_info"] = info
 
-        # New video means new transcript.
+        # Reset transcript cache for the new video.
         st.session_state["cached_transcription_config"] = None
         st.session_state["cached_transcript_path"] = None
 
-        # Clear previous results.
+        # Clear previous generated results.
         st.session_state["latest_clips"] = []
         st.session_state["latest_zip"] = None
         st.session_state["latest_title"] = None
@@ -283,13 +299,18 @@ def get_cached_video(
         return video_path, job_path, info
 
     except Exception:
+
         # Remove only the incomplete new download directory.
-        shutil.rmtree(job_path, ignore_errors=True)
+        shutil.rmtree(
+            job_path,
+            ignore_errors=True,
+        )
+
         raise
 
 
 # ============================================================
-# TRANSCRIPT CACHE
+# TRANSCRIPT VALIDATION
 # ============================================================
 
 def validate_transcript(
@@ -298,6 +319,7 @@ def validate_transcript(
     """Validate transcript segments and timestamps."""
 
     if not isinstance(transcript, list):
+
         raise ValueError(
             "Transcript must be a list of segments."
         )
@@ -305,18 +327,27 @@ def validate_transcript(
     valid_segments: list[dict[str, Any]] = []
 
     for segment in transcript:
+
         if not isinstance(segment, dict):
             continue
 
         try:
+
             start = float(segment["start"])
             end = float(segment["end"])
-            text = str(segment.get("text") or "").strip()
+
+            text = str(
+                segment.get("text") or ""
+            ).strip()
 
         except (KeyError, TypeError, ValueError):
             continue
 
-        if start < 0 or end <= start or not text:
+        if (
+            start < 0
+            or end <= start
+            or not text
+        ):
             continue
 
         valid_segments.append(
@@ -328,6 +359,7 @@ def validate_transcript(
         )
 
     if not valid_segments:
+
         raise ValueError(
             "No valid transcript segments were found."
         )
@@ -335,20 +367,28 @@ def validate_transcript(
     return valid_segments
 
 
+# ============================================================
+# TRANSCRIPT CACHE
+# ============================================================
+
 def get_cached_transcript(
     video: Path,
     job: Path,
-    model_size: str,
     device: str,
 ) -> tuple[list[dict[str, Any]], str]:
     """
-    Reuse transcript when the video, Whisper model, and
-    requested device configuration match.
+    Reuse transcript when the model and processing device match.
+
+    Whisper model is always fixed to base.
     """
 
     transcript_path = job / "transcript.json"
     metadata_path = job / "transcript_metadata.json"
-    transcription_config = (model_size, device)
+
+    transcription_config = (
+        WHISPER_MODEL,
+        device,
+    )
 
     cached_config = st.session_state.get(
         "cached_transcription_config"
@@ -359,7 +399,7 @@ def get_cached_transcript(
     )
 
     # --------------------------------------------------------
-    # REUSE TRANSCRIPT
+    # REUSE CACHED TRANSCRIPT
     # --------------------------------------------------------
 
     if (
@@ -368,26 +408,34 @@ def get_cached_transcript(
         and transcript_path.is_file()
         and metadata_path.is_file()
     ):
+
         try:
+
             with transcript_path.open(
                 "r",
                 encoding="utf-8",
             ) as file:
+
                 transcript_data = json.load(file)
 
             with metadata_path.open(
                 "r",
                 encoding="utf-8",
             ) as file:
+
                 metadata = json.load(file)
 
             if not isinstance(metadata, Mapping):
-                raise ValueError("Invalid transcript metadata.")
+
+                raise ValueError(
+                    "Invalid transcript metadata."
+                )
 
             if (
-                metadata.get("model_size") != model_size
+                metadata.get("model_size") != WHISPER_MODEL
                 or metadata.get("device") != device
             ):
+
                 raise ValueError(
                     "Cached transcript configuration mismatch."
                 )
@@ -400,11 +448,18 @@ def get_cached_transcript(
                 metadata.get("language") or "unknown"
             )
 
-            logger.info("Reusing cached transcript.")
+            logger.info(
+                "Reusing cached transcript."
+            )
 
             return valid_segments, language
 
-        except (OSError, ValueError, json.JSONDecodeError):
+        except (
+            OSError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+
             logger.warning(
                 "Cached transcript is invalid. Re-transcribing.",
                 exc_info=True,
@@ -416,18 +471,22 @@ def get_cached_transcript(
 
     logger.info(
         "Starting Whisper transcription. Model=%s Device=%s",
-        model_size,
+        WHISPER_MODEL,
         device,
     )
 
     transcript, language = transcribe_audio_with_whisper(
         file_path=str(video),
-        model_size=model_size,
         device=device,
     )
 
-    valid_segments = validate_transcript(transcript)
-    language = str(language or "unknown")
+    valid_segments = validate_transcript(
+        transcript
+    )
+
+    language = str(
+        language or "unknown"
+    )
 
     # --------------------------------------------------------
     # SAVE TRANSCRIPT
@@ -437,6 +496,7 @@ def get_cached_transcript(
         "w",
         encoding="utf-8",
     ) as file:
+
         json.dump(
             valid_segments,
             file,
@@ -446,7 +506,7 @@ def get_cached_transcript(
 
     metadata = {
         "language": language,
-        "model_size": model_size,
+        "model_size": WHISPER_MODEL,
         "device": device,
     }
 
@@ -454,6 +514,7 @@ def get_cached_transcript(
         "w",
         encoding="utf-8",
     ) as file:
+
         json.dump(
             metadata,
             file,
@@ -488,12 +549,7 @@ def create_output_zip(
     output_directory: Path,
     zip_path: Path,
 ) -> Path:
-    """
-    Create a ZIP archive of generated clips and subtitles.
-
-    MP4 files are already compressed, so ZIP_STORED avoids
-    wasting CPU trying to compress them again.
-    """
+    """Create a ZIP archive of generated clips and subtitles."""
 
     zip_path.parent.mkdir(
         parents=True,
@@ -503,14 +559,17 @@ def create_output_zip(
     with zipfile.ZipFile(
         zip_path,
         mode="w",
-        compression=zipfile.ZIP_STORED,
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=6,
     ) as archive:
 
         for file_path in output_directory.iterdir():
+
             if (
                 file_path.is_file()
                 and file_path != zip_path
             ):
+
                 archive.write(
                     file_path,
                     arcname=file_path.name,
@@ -539,83 +598,106 @@ def create_unique_output_directory(
     )
 
     output_job = OUTPUT_DIR / base_name
+
     counter = 1
 
     while output_job.exists():
-        output_job = OUTPUT_DIR / f"{base_name}_{counter}"
+
+        output_job = OUTPUT_DIR / (
+            f"{base_name}_{counter}"
+        )
+
         counter += 1
 
-    output_job.mkdir(parents=True, exist_ok=False,)
+    output_job.mkdir(
+        parents=True,
+        exist_ok=False,
+    )
 
     return output_job
 
 
+# ============================================================
+# CLEAR CACHE
+# ============================================================
+
 def clear_cache() -> None:
     """Delete the active cached video and transcript."""
 
-    cached_job = st.session_state.get("cached_job")
+    cached_job = st.session_state.get(
+        "cached_job"
+    )
 
     if cached_job:
+
         job_path = Path(cached_job)
 
-        # Safety: delete only a directory inside WORK_DIR.
-        if job_path.parent.resolve() == WORK_DIR.resolve():
-            shutil.rmtree(job_path, ignore_errors=True)
+        try:
+
+            resolved_job = job_path.resolve()
+            resolved_work = WORK_DIR.resolve()
+
+            # Delete only direct child directories of WORK_DIR.
+            if resolved_job.parent == resolved_work:
+
+                shutil.rmtree(
+                    resolved_job,
+                    ignore_errors=True,
+                )
+
+        except OSError:
+
+            logger.exception(
+                "Unable to remove cached working directory."
+            )
 
     for key, default_value in SESSION_DEFAULTS.items():
+
         st.session_state[key] = default_value
 
-    logger.info("Active video and transcript cache cleared.")
+    logger.info(
+        "Active video and transcript cache cleared."
+    )
 
 
 # ============================================================
 # SIDEBAR SETTINGS
 # ============================================================
 
-st.sidebar.header("⚙️ Generation Settings")
+st.sidebar.header(
+    "⚙️ Generation Settings"
+)
 
 clip_count = st.sidebar.selectbox(
     "Number of clips",
-    options=[1, 3, 5, 7],
-    index=0,
+    options=CLIP_COUNTS,
+    index=CLIP_COUNTS.index(
+        DEFAULT_CLIP_COUNT
+    ),
 )
 
 clip_length = st.sidebar.selectbox(
     "Clip duration",
-    options=[30, 45, 60],
-    index=1,
-)
-
-model_size = st.sidebar.selectbox(
-    "Whisper model",
-    options=["tiny", "base", "small", "medium"],
-    index=1,
+    options=CLIP_LENGTHS,
+    index=CLIP_LENGTHS.index(
+        DEFAULT_CLIP_LENGTH
+    ),
 )
 
 device_choice = st.sidebar.selectbox(
     "Processing device",
-    options=["cuda", "auto", "cpu"],
-    index=0,
+    options=PROCESSING_DEVICES,
+    index=PROCESSING_DEVICES.index(
+        DEFAULT_PROCESSING_DEVICE
+    ),
 )
 
 subtitle_style = st.sidebar.selectbox(
     "Subtitle style",
-    options=[
-        "Bold white",
-        "Yellow highlight",
-        "Minimal",
-    ],
-    index=0,
-)
-
-use_ollama = st.sidebar.checkbox(
-    "Use Ollama for AI moment selection",
-    value=True,
-)
-
-ollama_model = st.sidebar.text_input(
-    "Ollama model",
-    value="llama3.1:latest",
+    options=SUBTITLE_STYLES,
+    index=SUBTITLE_STYLES.index(
+        DEFAULT_SUBTITLE_STYLE
+    ),
 )
 
 st.sidebar.divider()
@@ -624,8 +706,13 @@ if st.sidebar.button(
     "🗑️ Clear cached video and transcript",
     use_container_width=True,
 ):
+
     clear_cache()
-    st.sidebar.success("Cache cleared.")
+
+    st.sidebar.success(
+        "Cache cleared."
+    )
+
     st.rerun()
 
 
@@ -654,16 +741,21 @@ if generate_button:
     video_url = url.strip()
 
     if not video_url:
-        st.error("Please enter a YouTube URL.")
+
+        st.error(
+            "Please enter a YouTube URL."
+        )
 
     elif not check_ffmpeg():
+
         st.error(
-            "FFmpeg was not found. Install FFmpeg and add it "
-            "to your system PATH."
+            "FFmpeg was not found or could not be executed. "
+            "Check the FFmpeg path in config.py."
         )
 
     else:
 
+        # Only one progress bar for the entire pipeline.
         progress = st.progress(
             0,
             text="Preparing your project...",
@@ -671,14 +763,12 @@ if generate_button:
 
         status = st.empty()
 
-        download_bar = st.progress(
-            0,
-            text="Waiting for download...",
-        )
-
         # Clear previous displayed results.
         st.session_state["latest_clips"] = []
         st.session_state["latest_zip"] = None
+        st.session_state["latest_title"] = None
+        st.session_state["latest_language"] = None
+        st.session_state["latest_duration"] = 0.0
 
         try:
 
@@ -686,68 +776,73 @@ if generate_button:
             # DEVICE VALIDATION
             # ------------------------------------------------
 
-            status.info("Checking processing device...")
+            status.info(
+                "Checking processing device..."
+            )
 
-            validate_processing_device(device_choice)
+            validate_processing_device(
+                device_choice
+            )
 
             logger.info(
                 "Selected processing device: %s",
                 device_choice,
             )
 
+            update_progress(
+                progress,
+                0,
+                "Processing device ready: 0%",
+            )
+
             # ------------------------------------------------
-            # STEP 1: DOWNLOAD OR REUSE VIDEO
+            # STEP 1: DOWNLOAD OR REUSE VIDEO (0-20%)
             # ------------------------------------------------
 
             status.info(
                 "Step 1/5: Downloading YouTube video..."
             )
 
-            
             last_download_percentage = [0.0]
 
             def download_progress_callback(
                 percentage: float,
             ) -> None:
-                """Update download and overall progress."""
+                """Update the single overall progress bar."""
 
                 current_percentage = max(
                     last_download_percentage[0],
-                    min(100.0, percentage),
+                    min(100.0, float(percentage)),
                 )
 
-                last_download_percentage[0] = current_percentage
-
-                download_bar.progress(
-                    int(current_percentage),
-                    text=(
-                        f"Downloading video: "
-                        f"{current_percentage:.1f}%"
-                    ),
+                last_download_percentage[0] = (
+                    current_percentage
                 )
 
-                overall_percentage = current_percentage * 0.20
+                overall_percentage = (
+                    current_percentage * 0.20
+                )
 
                 update_progress(
                     progress,
                     overall_percentage,
-                    f"Overall progress: {overall_percentage:.1f}%",
+                    (
+                        f"Downloading video: "
+                        f"{current_percentage:.1f}% "
+                        f"| Overall: {overall_percentage:.1f}%"
+                    ),
                 )
 
             with st.spinner(
                 "Downloading or checking cached video..."
             ):
+
                 video, job, info = get_cached_video(
                     video_url=video_url,
                     download_progress_callback=(
                         download_progress_callback
                     ),
                 )
-
-            download_bar.progress(
-                100,
-                text="Download completed: 100%",
-            )
 
             title = str(
                 info.get("title") or "YouTube video"
@@ -760,13 +855,15 @@ if generate_button:
             update_progress(
                 progress,
                 20,
-                "Download completed: 20%",
+                "Video ready: 20%",
             )
 
-            st.success(f"Video ready: {title}")
+            st.success(
+                f"Video ready: {title}"
+            )
 
             # ------------------------------------------------
-            # STEP 2: TRANSCRIPTION
+            # STEP 2: TRANSCRIPTION (20-45%)
             # ------------------------------------------------
 
             status.info(
@@ -776,17 +873,17 @@ if generate_button:
             update_progress(
                 progress,
                 20,
-                "Transcription started...",
+                "Transcription started: 20%",
             )
 
             with st.spinner(
-                f"🎙️ Transcribing with Whisper {model_size} "
+                f"🎙️ Transcribing with Whisper base "
                 f"on {device_choice.upper()}..."
             ):
+
                 transcript, language = get_cached_transcript(
                     video=video,
                     job=job,
-                    model_size=model_size,
                     device=device_choice,
                 )
 
@@ -801,16 +898,23 @@ if generate_button:
             )
 
             # ------------------------------------------------
-            # STEP 3: CANDIDATE MOMENTS
+            # STEP 3: CANDIDATE MOMENTS (45-55%)
             # ------------------------------------------------
 
             status.info(
                 "Step 3/5: Finding interesting moments..."
             )
 
+            update_progress(
+                progress,
+                45,
+                "Analyzing transcript: 45%",
+            )
+
             with st.spinner(
                 "Analyzing transcript and finding candidate moments..."
             ):
+
                 candidates = candidate_windows(
                     transcript,
                     duration,
@@ -818,6 +922,7 @@ if generate_button:
                 )
 
             if not candidates:
+
                 raise ValueError(
                     "No suitable candidate moments were found."
                 )
@@ -829,30 +934,26 @@ if generate_button:
             )
 
             # ------------------------------------------------
-            # STEP 4: AI MOMENT SELECTION
+            # STEP 4: MOMENT SELECTION (55-65%)
             # ------------------------------------------------
 
             status.info(
                 "Step 4/5: Selecting the best moments..."
             )
 
-            selection_label = (
-                ollama_model if use_ollama
-                else "default selection"
-            )
-
             with st.spinner(
-                f"🧠 Selecting moments using {selection_label}..."
+                "🧠 Selecting the best moments..."
             ):
+
+                # Local selection logic; no Ollama.
                 selected_moments = choose_moments(
                     candidates,
                     clip_count,
                     clip_length,
-                    use_ollama,
-                    ollama_model,
                 )
 
             if not selected_moments:
+
                 raise ValueError(
                     "No moments were selected for rendering."
                 )
@@ -864,7 +965,7 @@ if generate_button:
             )
 
             # ------------------------------------------------
-            # STEP 5: RENDER CLIPS
+            # STEP 5: RENDER CLIPS (65-95%)
             # ------------------------------------------------
 
             status.info(
@@ -878,19 +979,42 @@ if generate_button:
 
             generated_clips: list[dict[str, Any]] = []
 
-            total_moments = len(selected_moments)
+            total_moments = len(
+                selected_moments
+            )
 
             for index, moment in enumerate(
                 selected_moments,
                 start=1,
             ):
 
-                start_time = float(moment["start"])
-                end_time = float(moment["end"])
+                start_time = float(
+                    moment["start"]
+                )
 
-                if start_time < 0 or end_time <= start_time:
+                end_time = float(
+                    moment["end"]
+                )
+
+                if (
+                    start_time < 0
+                    or end_time <= start_time
+                    or end_time > duration + 0.1
+                ):
+
                     raise ValueError(
-                        f"Invalid time range for clip {index}."
+                        f"Invalid time range for clip {index}: "
+                        f"{start_time:.2f} - {end_time:.2f}"
+                    )
+
+                actual_clip_length = (
+                    end_time - start_time
+                )
+
+                if actual_clip_length <= 0:
+
+                    raise ValueError(
+                        f"Invalid clip duration for clip {index}."
                     )
 
                 ass_path = (
@@ -906,10 +1030,11 @@ if generate_button:
                 )
 
                 logger.info(
-                    "Rendering clip %d: %.2f - %.2f",
+                    "Rendering clip %d: %.2f - %.2f (%.2f seconds)",
                     index,
                     start_time,
                     end_time,
+                    actual_clip_length,
                 )
 
                 with st.spinner(
@@ -934,7 +1059,7 @@ if generate_button:
                     run_ffmpeg(
                         video,
                         start_time,
-                        clip_length,
+                        actual_clip_length,
                         ass_path,
                         mp4_path,
                     )
@@ -943,6 +1068,7 @@ if generate_button:
                     not mp4_path.is_file()
                     or mp4_path.stat().st_size == 0
                 ):
+
                     raise FileNotFoundError(
                         f"Rendered clip is missing or empty: {mp4_path}"
                     )
@@ -965,16 +1091,19 @@ if generate_button:
                     progress,
                     render_percentage,
                     (
-                        f"Generating clips: {index}/{total_moments} "
-                        f"({render_percentage:.1f}%)"
+                        f"Rendering clips: "
+                        f"{index}/{total_moments} "
+                        f"| Overall: {render_percentage:.1f}%"
                     ),
                 )
 
             # ------------------------------------------------
-            # CREATE ZIP BUNDLE
+            # CREATE ZIP BUNDLE (95-100%)
             # ------------------------------------------------
 
-            status.info("Creating ZIP bundle...")
+            status.info(
+                "Creating ZIP bundle..."
+            )
 
             update_progress(
                 progress,
@@ -982,24 +1111,44 @@ if generate_button:
                 "Packaging generated clips: 95%",
             )
 
-            zip_path = output_job / "shorts_bundle.zip"
+            zip_path = (
+                output_job / "shorts_bundle.zip"
+            )
 
             with st.spinner(
                 "📦 Packaging your generated clips..."
             ):
+
                 create_output_zip(
                     output_directory=output_job,
                     zip_path=zip_path,
+                )
+
+            if (
+                not zip_path.is_file()
+                or zip_path.stat().st_size == 0
+            ):
+
+                raise FileNotFoundError(
+                    "ZIP bundle was not created successfully."
                 )
 
             # ------------------------------------------------
             # SAVE RESULTS
             # ------------------------------------------------
 
-            st.session_state["latest_clips"] = generated_clips
-            st.session_state["latest_zip"] = str(zip_path)
+            st.session_state["latest_clips"] = (
+                generated_clips
+            )
+
+            st.session_state["latest_zip"] = str(
+                zip_path
+            )
+
             st.session_state["latest_title"] = title
+
             st.session_state["latest_language"] = language
+
             st.session_state["latest_duration"] = duration
 
             update_progress(
@@ -1023,9 +1172,13 @@ if generate_button:
                 "Shorts generation failed."
             )
 
-            status.error("Shorts generation failed.")
+            status.error(
+                "Shorts generation failed."
+            )
 
-            st.error(str(exc))
+            st.error(
+                str(exc)
+            )
 
         finally:
 
@@ -1035,7 +1188,7 @@ if generate_button:
 
 
 # ============================================================
-# DISPLAY GENERATED CLIPS - 3 COLUMN GRID
+# DISPLAY GENERATED CLIPS
 # ============================================================
 
 latest_clips = st.session_state.get(
@@ -1046,34 +1199,67 @@ latest_clips = st.session_state.get(
 if latest_clips:
 
     st.divider()
-    st.header("🎉 Generated Shorts")
 
-    latest_title = st.session_state.get("latest_title")
-    latest_language = st.session_state.get("latest_language")
+    st.header(
+        "🎉 Generated Shorts"
+    )
+
+    latest_title = st.session_state.get(
+        "latest_title"
+    )
+
+    latest_language = st.session_state.get(
+        "latest_language"
+    )
 
     if latest_title:
-        st.caption(f"Source video: {latest_title}")
+
+        st.caption(
+            f"Source video: {latest_title}"
+        )
 
     if latest_language:
-        st.caption(f"Transcript language: {latest_language}")
+
+        st.caption(
+            f"Transcript language: {latest_language}"
+        )
 
     # Display 3 clips per row.
-    for row_start in range(0, len(latest_clips), 3):
+    for row_start in range(
+        0,
+        len(latest_clips),
+        3,
+    ):
 
-        columns = st.columns(3, gap="small")
+        columns = st.columns(
+            3,
+            gap="small",
+        )
 
-        row_clips = latest_clips[row_start:row_start + 3]
+        row_clips = latest_clips[
+            row_start:row_start + 3
+        ]
 
-        for column, clip in zip(columns, row_clips):
+        for column, clip in zip(
+            columns,
+            row_clips,
+        ):
 
             clip_number = clip["index"]
 
-            video_path = Path(clip["video"])
-            subtitle_path = Path(clip["subtitle"])
+            video_path = Path(
+                clip["video"]
+            )
+
+            subtitle_path = Path(
+                clip["subtitle"]
+            )
 
             with column:
 
-                st.markdown(f"**Short {clip_number}**")
+                st.markdown(
+                    f"**Short {clip_number}**"
+                )
 
                 st.caption(
                     f"{clip['start']:.1f}s – {clip['end']:.1f}s"
@@ -1098,7 +1284,10 @@ if latest_clips:
                         )
 
                 else:
-                    st.warning("Video file not found.")
+
+                    st.warning(
+                        "Video file not found."
+                    )
 
                 if subtitle_path.is_file():
 
@@ -1119,7 +1308,9 @@ if latest_clips:
     # DOWNLOAD ALL CLIPS
     # --------------------------------------------------------
 
-    latest_zip = st.session_state.get("latest_zip")
+    latest_zip = st.session_state.get(
+        "latest_zip"
+    )
 
     if latest_zip and Path(latest_zip).is_file():
 

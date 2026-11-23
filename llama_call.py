@@ -1,60 +1,56 @@
-from logger_config import log_step,logger
-import time
-import json
-import requests
 
-def call_llama(prompt, model):
-    log_step("LLAMA", "Starting AI moment selection")
-    start_time = time.perf_counter()
+from __future__ import annotations
 
-    try:
-        logger.info("Llama model: %s", model)
-        logger.info("Prompt size: %d characters", len(prompt))
+from typing import Any
 
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "format": "json"
-            },
-            timeout=180
+from logger_config import log_step, logger
+
+
+# ============================================================
+# SPREAD SELECTED CLIPS
+# ============================================================
+
+def spread_out(
+    candidates: list[dict[str, Any]],
+    count: int,
+    clip_len: int,
+) -> list[dict[str, Any]]:
+    """Select clips while avoiding overlapping or nearby moments."""
+
+    if count <= 0:
+        raise ValueError(
+            "Clip count must be greater than zero."
         )
 
-        response.raise_for_status()
-        result = response.json().get(
-            "response",
-            ""
+    if clip_len <= 0:
+        raise ValueError(
+            "Clip length must be greater than zero."
         )
 
-        elapsed = time.perf_counter() - start_time
+    selected: list[dict[str, Any]] = []
 
-        logger.info("Llama response received")
-        logger.info("Response length: %d", len(result))
-        logger.info("Llama execution time: %.2f seconds", elapsed)
-        return result
-
-    except Exception:
-        logger.exception("Llama API request failed")
-        raise
-    
-def spread_out(candidates, count, clip_len):
-    selected = []
     min_gap = clip_len * 0.65
 
+    # First pass: select clips with sufficient separation.
     for candidate in candidates:
+
         if all(
-            abs(candidate["start"] - item["start"]) >= min_gap
+            abs(
+                candidate["start"] - item["start"]
+            ) >= min_gap
             for item in selected
         ):
+
             selected.append(candidate)
 
         if len(selected) == count:
             break
 
+    # Second pass: fill remaining slots if necessary.
     if len(selected) < count:
+
         for candidate in candidates:
+
             if candidate not in selected:
                 selected.append(candidate)
 
@@ -63,131 +59,97 @@ def spread_out(candidates, count, clip_len):
 
     return sorted(
         selected[:count],
-        key=lambda x: x["start"]
+        key=lambda item: item["start"],
     )
-    
-    
-    
+
+
+# ============================================================
+# SELECT BEST MOMENTS
+# ============================================================
+
 def choose_moments(
-    candidates,
-    count,
-    clip_len,
-    use_ai,
-    model
-):
+    candidates: list[dict[str, Any]],
+    count: int,
+    clip_len: int,
+) -> list[dict[str, Any]]:
+    """
+    Select the best Shorts moments using local candidate scores.
 
-    log_step("SELECTION", "Selecting best Shorts moments")
+    No Ollama, API, external AI service, or model is required.
+    """
 
-    logger.info("Available candidates: %d", len(candidates))
-    logger.info("Requested clips: %d", count)
-    logger.info("AI ranking enabled: %s", use_ai)
+    log_step(
+        "SELECTION",
+        "Selecting best Shorts moments",
+    )
+
+    logger.info(
+        "Available candidates: %d",
+        len(candidates),
+    )
+
+    logger.info(
+        "Requested clips: %d",
+        count,
+    )
 
     if not candidates:
+
         raise RuntimeError(
             "No suitable candidate moments found."
         )
 
-    ranked = candidates[:min(30, len(candidates))]
+    if count <= 0:
 
-    selected = []
+        raise ValueError(
+            "Requested clip count must be greater than zero."
+        )
 
-    if use_ai:
-        try:
-            compact = [
-                {
-                    "id": i,
-                    "start": round(candidate["start"], 1),
-                    "text": candidate["text"][:900]
-                }
-                for i, candidate in enumerate(ranked)
-            ]
+    # Candidate windows are already ranked by score.
+    ranked = sorted(
+        candidates,
+        key=lambda item: float(item.get("score", 0)),
+        reverse=True,
+    )
 
-            prompt = (
-                "You are an expert YouTube Shorts editor. "
-                "Choose distinct, compelling, self-contained moments "
-                "with a strong hook, useful insight, story payoff, "
-                "or surprising point. Avoid repetitive sections. "
-                'Return ONLY valid JSON: {"selected_ids":[integers]}. '
-                f"Select exactly {count} unique IDs from: "
-                f"{json.dumps(compact, ensure_ascii=False)}"
-            )
+    # Use the best candidates for selection.
+    ranked = ranked[:min(30, len(ranked))]
 
-            raw = call_llama(prompt, model)
+    logger.info(
+        "Using top %d candidates for selection.",
+        len(ranked),
+    )
 
-            data = json.loads(raw)
-
-            ids = data.get("selected_ids", [])
-
-            if not isinstance(ids, list):
-                raise ValueError("Ollama returned an invalid selected_ids list.")
-
-            valid_ids = []
-
-            for item in ids:
-                if (
-                    isinstance(item, int)
-                    and not isinstance(item, bool)
-                    and 0 <= item < len(ranked)
-                    and item not in valid_ids
-                ):
-
-                    valid_ids.append(item)
-
-            selected = [
-                ranked[i]
-                for i in valid_ids
-            ]
-
-            logger.info(
-                "Ollama selected %d unique moments",
-                len(selected)
-            )
-
-        except Exception:
-            logger.exception(
-                "AI moment selection failed. Using local ranking."
-            )
-
-            selected = []
+    selected = spread_out(
+        ranked,
+        count,
+        clip_len,
+    )
 
     if len(selected) < count:
-        logger.info(
-            "Filling remaining clips using local candidate ranking."
-        )
 
-        combined = selected + [
-            candidate
-            for candidate in ranked
-            if candidate not in selected
-        ]
-
-        selected = spread_out(
-            combined,
-            count,
-            clip_len
-        )
-
-    else:
-        selected = spread_out(
-            selected,
-            count,
-            clip_len
-        )
-
-    if len(selected) < count:
         raise RuntimeError(
             f"Only {len(selected)} suitable clips found. "
             f"Requested {count}. Try a shorter clip length "
             "or fewer clips."
         )
 
-    for index, moment in enumerate(selected, 1):
+    for index, moment in enumerate(
+        selected,
+        start=1,
+    ):
+
         logger.info(
             "Selected clip %d | Start: %.2f | End: %.2f | Score: %.4f",
             index,
             moment["start"],
             moment["end"],
-            moment["score"]
+            moment.get("score", 0),
         )
+
+    logger.info(
+        "Successfully selected %d clips.",
+        len(selected),
+    )
 
     return selected

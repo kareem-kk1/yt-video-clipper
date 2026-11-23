@@ -1,50 +1,86 @@
+
 from __future__ import annotations
+
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
-import yt_dlp
-from yt_dlp.utils import DownloadError
-from logger_config import logger, log_step
-from collections.abc import Callable
 
+import yt_dlp
+
+from config import (
+    COOKIE_FILE,
+    FFMPEG_DIR,
+    configure_ffmpeg,
+)
+
+from logger_config import logger, log_step
+
+
+# ============================================================
+# DOWNLOAD PROGRESS
+# ============================================================
 
 def create_progress_hook(
     progress_callback: Callable[[float], None] | None = None,
 ) -> Callable[[dict[str, Any]], None]:
-    """Create a yt-dlp progress hook for Streamlit."""
+    """Create a yt-dlp progress hook for logging and Streamlit."""
+
+    last_percent = -1
 
     def progress_hook(data: dict[str, Any]) -> None:
-
-        if progress_callback is None:
-            return
+        nonlocal last_percent
 
         status = data.get("status")
 
         if status == "downloading":
 
-            downloaded = float(
-                data.get("downloaded_bytes") or 0
-            )
-
-            total = float(
-                data.get("total_bytes")
-                or data.get("total_bytes_estimate")
-                or 0
-            )
-
-            if total > 0:
-
-                percentage = min(
-                    100.0,
-                    (downloaded / total) * 100,
+            try:
+                downloaded = float(
+                    data.get("downloaded_bytes") or 0
                 )
 
+                total = float(
+                    data.get("total_bytes")
+                    or data.get("total_bytes_estimate")
+                    or 0
+                )
+
+            except (TypeError, ValueError, OverflowError):
+                return
+
+            if total <= 0:
+                return
+
+            percentage = min(
+                100.0,
+                (downloaded / total) * 100,
+            )
+
+            if progress_callback is not None:
                 progress_callback(percentage)
+
+            current_percent = int(percentage)
+
+            if (
+                current_percent != last_percent
+                and current_percent % 10 == 0
+            ):
+                logger.info(
+                    "Download progress: %d%%",
+                    current_percent,
+                )
+
+                last_percent = current_percent
 
         elif status == "finished":
 
-            progress_callback(100.0)
+            logger.info(
+                "Download finished. Processing video and audio..."
+            )
+
+            if progress_callback is not None:
+                progress_callback(100.0)
 
     return progress_hook
 
@@ -53,17 +89,18 @@ def create_progress_hook(
 # COOKIE VALIDATION
 # ============================================================
 
-def has_valid_netscape_cookies(cookie_content: str) -> bool:
+def has_valid_netscape_cookies(
+    cookie_content: str,
+) -> bool:
     """
-    Check whether cookie content contains recognizable
-    Netscape-format cookie entries.
+    Check for recognizable Netscape-format cookie entries.
 
-    Supports regular cookies and #HttpOnly_ entries.
+    Supports regular and #HttpOnly_ cookie entries.
 
-    Note:
-        This checks the file structure only. It cannot verify
-        whether the cookies are still authenticated or valid.
+    This checks file structure only, not whether the
+    cookies are currently authenticated.
     """
+
     for line in cookie_content.splitlines():
 
         line = line.strip()
@@ -71,8 +108,9 @@ def has_valid_netscape_cookies(cookie_content: str) -> bool:
         if not line:
             continue
 
-        # Ignore comments except HttpOnly cookie entries.
-        if line.startswith("#") and not line.startswith("#HttpOnly_"):
+        if line.startswith("#") and not line.startswith(
+            "#HttpOnly_"
+        ):
             continue
 
         if line.startswith("#HttpOnly_"):
@@ -80,21 +118,54 @@ def has_valid_netscape_cookies(cookie_content: str) -> bool:
 
         fields = line.split("\t")
 
-        # Netscape format contains seven tab-separated fields.
-        if len(fields) >= 7:
+        if len(fields) == 7:
             return True
 
     return False
 
 
+def cookies_file_available() -> bool:
+    """Check whether the project cookies.txt file is usable."""
+
+    if not COOKIE_FILE.is_file():
+        logger.info("cookies.txt not found.")
+        return False
+
+    try:
+        content = COOKIE_FILE.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        )
+
+        if has_valid_netscape_cookies(content):
+            logger.info(
+                "Recognizable Netscape cookie entries detected."
+            )
+            return True
+
+        logger.warning(
+            "cookies.txt is empty or has an invalid format."
+        )
+
+    except OSError:
+        logger.warning(
+            "Unable to read cookies.txt.",
+            exc_info=True,
+        )
+
+    return False
+
+
 # ============================================================
-# DOWNLOAD HELPERS
+# ERROR HANDLING
 # ============================================================
 
-def is_authentication_error(error: Exception | str) -> bool:
+def is_authentication_error(
+    error: Exception | str,
+) -> bool:
     """Identify common YouTube authentication errors."""
 
-    error_message = str(error).lower()
+    message = str(error).lower()
 
     authentication_errors = (
         "sign in to confirm",
@@ -105,41 +176,63 @@ def is_authentication_error(error: Exception | str) -> bool:
         "confirm you're not a bot",
         "use --cookies-from-browser",
         "members-only",
+        "private video",
+        "age-restricted",
     )
 
     return any(
-        message in error_message
-        for message in authentication_errors
+        item in message
+        for item in authentication_errors
     )
 
+
+def is_browser_cookie_error(
+    error: Exception | str,
+) -> bool:
+    """Identify errors accessing Chrome's cookie database."""
+
+    message = str(error).lower()
+
+    cookie_errors = (
+        "could not copy chrome cookie database",
+        "failed to load cookies",
+        "cookie database",
+        "could not decrypt",
+        "failed to decrypt",
+    )
+
+    return any(
+        item in message
+        for item in cookie_errors
+    )
+
+
+# ============================================================
+# DOWNLOADED VIDEO DETECTION
+# ============================================================
 
 def find_downloaded_video(
     folder: Path,
     prepared_path: Path,
 ) -> Path:
-    """
-    Locate the downloaded video, preferring the merged MP4 file.
-    """
+    """Find the final downloaded video, preferring MP4."""
 
-    # yt-dlp may return the pre-merge filename.
-    if prepared_path.suffix.lower() != ".mp4":
-
-        merged_path = prepared_path.with_suffix(".mp4")
-
-        if merged_path.is_file():
-            return merged_path
-
-    # Prefer the expected output filename.
+    # Check the expected merged MP4 file first.
     expected_mp4 = folder / "source.mp4"
 
     if expected_mp4.is_file():
         return expected_mp4
 
-    # Use the prepared filename if it exists.
+    # Check the filename returned by yt-dlp.
     if prepared_path.is_file():
         return prepared_path
 
-    # Ignore temporary files and metadata.
+    merged_path = prepared_path.with_suffix(".mp4")
+
+    if merged_path.is_file():
+        return merged_path
+
+    # Search for remaining media files.
     ignored_extensions = {
         ".part",
         ".ytdl",
@@ -166,7 +259,6 @@ def find_downloaded_video(
             "Downloaded video file was not found."
         )
 
-    # Prefer MP4 candidates.
     mp4_candidates = [
         item
         for item in candidates
@@ -176,21 +268,22 @@ def find_downloaded_video(
     if mp4_candidates:
         return mp4_candidates[0]
 
-    # Otherwise, select the largest available media file.
     return max(
         candidates,
         key=lambda item: item.stat().st_size,
     )
 
 
+# ============================================================
+# YT-DLP DOWNLOAD HELPER
+# ============================================================
+
 def download_with_options(
     video_url: str,
     options: dict[str, Any],
     folder_path: Path,
 ) -> tuple[Path, dict[str, Any]]:
-    """
-    Execute yt-dlp using the supplied authentication options.
-    """
+    """Download a video using the supplied yt-dlp options."""
 
     with yt_dlp.YoutubeDL(cast(Any, options)) as ydl:
 
@@ -204,13 +297,12 @@ def download_with_options(
                 "yt-dlp returned invalid video metadata."
             )
 
-        info: Mapping[str, Any] = info_result
+        info = info_result
 
         prepared_path = Path(
             ydl.prepare_filename(info)
         )
 
-    # Find the actual downloaded/merged video.
     video_path = find_downloaded_video(
         folder_path,
         prepared_path,
@@ -221,9 +313,7 @@ def download_with_options(
             f"Downloaded video does not exist: {video_path}"
         )
 
-    file_size = video_path.stat().st_size
-
-    if file_size <= 0:
+    if video_path.stat().st_size <= 0:
         raise RuntimeError(
             "Downloaded video file is empty."
         )
@@ -236,23 +326,20 @@ def download_with_options(
 # ============================================================
 
 def download_video(
-      video_url: str,
-      folder: Path,
-      APP_DIR: Path,
-      progress_callback: Callable[[float], None] | None = None,
-  ) -> tuple[Path, dict[str, Any]]:
+    video_url: str,
+    folder: Path,
+    progress_callback: Callable[[float], None] | None = None,
+) -> tuple[Path, dict[str, Any]]:
     """
     Download a YouTube video using yt-dlp.
 
     Authentication priority:
-        1. Use valid-looking cookies.txt if available.
-        2. If missing/empty, use Chrome browser cookies.
-        3. If cookies.txt is rejected for authentication,
-           retry using Chrome browser cookies.
+        1. cookies.txt, if available.
+        2. Public download.
+        3. Chrome browser cookies if authentication is required.
 
     Returns:
-        tuple[Path, dict[str, Any]]:
-            Downloaded video path and yt-dlp metadata.
+        Downloaded video path and video metadata.
     """
 
     log_step(
@@ -262,154 +349,32 @@ def download_video(
 
     start_time = time.perf_counter()
 
-    last_percent = -1
+    folder_path = Path(folder)
+
     authentication_method = "unknown"
 
     try:
 
-        # --------------------------------------------------
-        # DIRECTORY SETUP
-        # --------------------------------------------------
-
-        folder_path = Path(folder)
-        app_dir = Path(APP_DIR)
+        # ----------------------------------------------------
+        # DIRECTORY AND FFMPEG SETUP
+        # ----------------------------------------------------
 
         folder_path.mkdir(
             parents=True,
             exist_ok=True,
         )
 
-        cookie_file = app_dir / "cookies.txt"
+        configure_ffmpeg()
 
-        # --------------------------------------------------
-        # DOWNLOAD PROGRESS HOOK
-        # --------------------------------------------------
+        if not video_url.strip():
+            raise ValueError("YouTube URL cannot be empty.")
 
-        def download_progress_hook(
-            data: dict[str, Any],
-        ) -> None:
+        # ----------------------------------------------------
+        # BASE DOWNLOAD OPTIONS
+        # ----------------------------------------------------
 
-            nonlocal last_percent
-
-            status = data.get("status")
-
-            if status == "downloading":
-
-                downloaded = data.get(
-                    "downloaded_bytes",
-                    0,
-                )
-
-                total = (
-                    data.get("total_bytes")
-                    or data.get("total_bytes_estimate")
-                    or 0
-                )
-
-                try:
-                    downloaded_bytes = int(downloaded or 0)
-                    total_bytes = int(total or 0)
-
-                except (
-                    TypeError,
-                    ValueError,
-                    OverflowError,
-                ):
-
-                    logger.warning(
-                        "Invalid download progress values received."
-                    )
-                    return
-
-                if total_bytes > 0:
-
-                    percent = min(
-                        100,
-                        int(
-                            downloaded_bytes * 100 / total_bytes
-                        ),
-                    )
-
-                    if (
-                        percent != last_percent
-                        and percent % 10 == 0
-                    ):
-
-                        logger.info(
-                            "Download progress: %d%%",
-                            percent,
-                        )
-
-                        last_percent = percent
-
-            elif status == "finished":
-
-                logger.info(
-                    "Download completed. "
-                    "Merging video if required."
-                )
-
-        # --------------------------------------------------
-        # CHECK COOKIE FILE
-        # --------------------------------------------------
-
-        use_cookie_file = False
-
-        if cookie_file.is_file():
-
-            try:
-
-                cookie_size = cookie_file.stat().st_size
-
-                if cookie_size > 0:
-
-                    cookie_content = cookie_file.read_text(
-                        encoding="utf-8",
-                        errors="ignore",
-                    )
-
-                    use_cookie_file = has_valid_netscape_cookies(
-                        cookie_content,
-                    )
-
-                    if use_cookie_file:
-
-                        logger.info(
-                            "Valid-looking Netscape cookie entries detected."
-                        )
-
-                    else:
-
-                        logger.warning(
-                            "cookies.txt does not contain recognizable "
-                            "Netscape cookie entries."
-                        )
-
-                else:
-
-                    logger.warning(
-                        "cookies.txt is empty."
-                    )
-
-            except OSError:
-
-                logger.warning(
-                    "Unable to read cookies.txt.",
-                    exc_info=True,
-                )
-
-        else:
-
-            logger.info(
-                "cookies.txt not found."
-            )
-
-        # --------------------------------------------------
-        # BASE YT-DLP OPTIONS
-        # --------------------------------------------------
-
-        outtmpl = str(
-            folder_path / "source.%(ext)s"
+        progress_hook = create_progress_hook(
+            progress_callback
         )
 
         base_options: dict[str, Any] = {
@@ -417,62 +382,111 @@ def download_video(
                 "bestvideo[height<=1080]+bestaudio/"
                 "best[height<=1080]/best"
             ),
+            "ffmpeg_location": str(FFMPEG_DIR),
             "merge_output_format": "mp4",
-            "outtmpl": outtmpl,
+            "outtmpl": str(
+                folder_path / "source.%(ext)s"
+            ),
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
-            "progress_hooks": [
-                download_progress_hook
-            ],
+            "progress_hooks": [progress_hook],
             "retries": 3,
             "fragment_retries": 3,
             "socket_timeout": 30,
         }
-        base_options["progress_hooks"] = [create_progress_hook(progress_callback)
-]
+
         logger.info(
             "YouTube URL: %s",
             video_url,
         )
 
-        
-        # --------------------------------------------------
-        # AUTHENTICATION
-        # --------------------------------------------------
+        # ----------------------------------------------------
+        # FIRST ATTEMPT
+        # ----------------------------------------------------
 
-        if use_cookie_file:
+        if cookies_file_available():
+
             authentication_method = "cookies.txt"
 
             logger.info(
-                "Authentication: Using exported cookies.txt"
+                "Attempting download using cookies.txt."
             )
 
             download_options = {
                 **base_options,
-                "cookiefile": str(cookie_file),
+                "cookiefile": str(COOKIE_FILE),
             }
 
         else:
+
             authentication_method = "public"
 
             logger.info(
-                "Authentication: No cookies available. "
                 "Attempting public video download."
             )
 
             download_options = base_options
 
-        video_path, info = download_with_options(
-            video_url=video_url,
-            options=download_options,
-            folder_path=folder_path,
-)
+        try:
 
-   
-        # --------------------------------------------------
+            video_path, info = download_with_options(
+                video_url=video_url,
+                options=download_options,
+                folder_path=folder_path,
+            )
+
+        except Exception as first_error:
+
+            # -----------------------------------------------
+            # CHROME COOKIE FALLBACK
+            # -----------------------------------------------
+
+            if not is_authentication_error(first_error):
+                raise
+
+            logger.warning(
+                "Authentication required. "
+                "Retrying with Chrome browser cookies."
+            )
+
+            authentication_method = "chrome"
+
+            chrome_options = {
+                **base_options,
+                "cookiesfrombrowser": ("chrome",),
+            }
+
+            try:
+
+                video_path, info = download_with_options(
+                    video_url=video_url,
+                    options=chrome_options,
+                    folder_path=folder_path,
+                )
+
+            except Exception as chrome_error:
+
+                if is_browser_cookie_error(chrome_error):
+                    raise RuntimeError(
+                        "Unable to access Chrome cookies. "
+                        "Close Chrome completely and try again, "
+                        "or export YouTube cookies in Netscape "
+                        "format and save them as cookies.txt."
+                    ) from chrome_error
+
+                if is_authentication_error(chrome_error):
+                    raise RuntimeError(
+                        "YouTube authentication failed. "
+                        "Export fresh YouTube cookies and save "
+                        "them as cookies.txt in the project folder."
+                    ) from chrome_error
+
+                raise
+
+        # ----------------------------------------------------
         # DOWNLOAD SUMMARY
-        # --------------------------------------------------
+        # ----------------------------------------------------
 
         file_size = video_path.stat().st_size
 
@@ -489,12 +503,12 @@ def download_video(
         )
 
         logger.info(
-            "Video duration: %s",
+            "Video duration: %s seconds",
             info.get("duration", "Unknown"),
         )
 
         logger.info(
-            "Video file: %s",
+            "Downloaded file: %s",
             video_path,
         )
 
@@ -514,47 +528,27 @@ def download_video(
         )
 
         return video_path, info
-    
-    
+
     except Exception as error:
 
         logger.exception(
             "YouTube video download failed."
         )
 
-        error_message = str(error).lower()
-
-        if (
-            "could not copy chrome cookie database"
-            in error_message
-            or "failed to load cookies" in error_message
-            or "cookie database" in error_message
-        ):
+        if is_browser_cookie_error(error):
             raise RuntimeError(
-                "Unable to access browser cookies. "
-                "Export YouTube cookies in Netscape format "
-                "and save them as cookies.txt in the project folder."
+                "Unable to access Chrome browser cookies. "
+                "Close Chrome completely or export YouTube "
+                "cookies to cookies.txt."
             ) from error
 
         if is_authentication_error(error):
-
-            if authentication_method == "cookies.txt":
-                raise RuntimeError(
-                    "YouTube rejected cookies.txt. "
-                    "Your session may have expired. "
-                    "Export fresh YouTube cookies and replace the file."
-                ) from error
-
             raise RuntimeError(
                 "YouTube requires authentication for this video. "
-                "Please export your signed-in YouTube session "
-                "as cookies.txt."
+                "Please export fresh YouTube cookies and save "
+                "them as cookies.txt in the project folder."
             ) from error
 
         raise RuntimeError(
             f"YouTube video download failed: {error}"
         ) from error
-
-    
-    
-    
