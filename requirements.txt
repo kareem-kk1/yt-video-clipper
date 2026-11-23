@@ -1,0 +1,15 @@
+
+# PyTorch CUDA 12.1
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+
+# Application dependencies
+streamlit>=1.36
+yt-dlp[default]
+openai-whisper
+requests>=2.31
+
+
